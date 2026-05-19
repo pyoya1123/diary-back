@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log
+dist
+.git
+.gitignore
+.env
+.env.local
+.env.*.local
+README.md
+docs
+.vscode
+.DS_Store
+*.log
+coverage
+.nyc_output
+supabase/migrations

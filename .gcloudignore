@@ -1,0 +1,15 @@
+# This file specifies files that gcloud should NOT upload
+node_modules
+npm-debug.log
+dist
+.git
+.gitignore
+.env
+.env.local
+.env.*.local
+docs
+.vscode
+.DS_Store
+*.log
+coverage
+.nyc_output
