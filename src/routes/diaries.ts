@@ -46,6 +46,8 @@ const updateDiarySchema = z.object({
   images:     z.array(imageSchema).max(3, '사진은 최대 3장까지 첨부할 수 있습니다.').optional(),
 });
 
+const uuidSchema = z.string().uuid();
+
 // ────────────────────────────────────────────────────────────
 // 유틸
 // ────────────────────────────────────────────────────────────
@@ -56,12 +58,97 @@ function isFutureDate(dateStr: string): boolean {
   return dateStr > today;
 }
 
+type DiaryReadRow = {
+  diary_id: string;
+  read_at: string;
+};
+
+type SupabaseErrorLike = {
+  code?: string;
+  message?: string;
+};
+
+let warnedMissingDiaryReadsTable = false;
+
+function parseIdList(value: unknown): { ids: string[]; error?: string } {
+  if (typeof value !== 'string') {
+    return { ids: [], error: 'ids query parameter is required.' };
+  }
+
+  const ids = [
+    ...new Set(value.split(',').map((id) => id.trim()).filter(Boolean)),
+  ];
+
+  if (ids.length === 0) {
+    return { ids: [], error: 'ids query parameter is required.' };
+  }
+
+  if (ids.some((id) => !uuidSchema.safeParse(id).success)) {
+    return { ids: [], error: 'ids must be comma-separated UUIDs.' };
+  }
+
+  return { ids };
+}
+
+async function fetchMyReadMap(
+  supabase: ReturnType<typeof createUserClient>,
+  userId: string,
+  diaryIds: string[],
+): Promise<{ readMap: Map<string, string>; error: unknown }> {
+  const readMap = new Map<string, string>();
+
+  if (diaryIds.length === 0) {
+    return { readMap, error: null };
+  }
+
+  const { data, error } = await supabase
+    .from('diary_reads')
+    .select('diary_id, read_at')
+    .eq('user_id', userId)
+    .in('diary_id', diaryIds);
+
+  if (error) {
+    if (isDiaryReadsUnavailableError(error)) {
+      warnMissingDiaryReadsTable(error);
+      return { readMap, error: null };
+    }
+
+    return { readMap, error };
+  }
+
+  for (const row of (data ?? []) as DiaryReadRow[]) {
+    readMap.set(row.diary_id, row.read_at);
+  }
+
+  return { readMap, error: null };
+}
+
 // ────────────────────────────────────────────────────────────
+function isDiaryReadsUnavailableError(error: SupabaseErrorLike): boolean {
+  return (
+    error.code === 'PGRST205' ||
+    error.code === '42P01' ||
+    Boolean(error.message?.includes("Could not find the table 'public.diary_reads'"))
+  );
+}
+
+function warnMissingDiaryReadsTable(error: SupabaseErrorLike) {
+  if (warnedMissingDiaryReadsTable) {
+    return;
+  }
+
+  warnedMissingDiaryReadsTable = true;
+  console.warn(
+    '[DIARY READ] diary_reads table is unavailable. Apply supabase/migrations/20260611000000_add_diary_reads.sql and reload the Supabase schema cache.',
+    error,
+  );
+}
+
 // GET /diaries
 // 커플 공간의 일기 목록 (이미지 포함, 최신순)
 // ────────────────────────────────────────────────────────────
 router.get('/', authenticate, async (req: Request, res: Response): Promise<void> => {
-  const { accessToken } = req as AuthenticatedRequest;
+  const { userId, accessToken } = req as AuthenticatedRequest;
   const supabase = createUserClient(accessToken);
 
   const { data, error } = await supabase
@@ -75,7 +162,25 @@ router.get('/', authenticate, async (req: Request, res: Response): Promise<void>
     return;
   }
 
-  sendSuccess(res, data ?? []);
+  const diaries = data ?? [];
+  const { readMap, error: readsError } = await fetchMyReadMap(
+    supabase,
+    userId,
+    diaries.map((diary) => diary.id as string),
+  );
+
+  if (readsError) {
+    sendInternalError(res, 'Failed to fetch diary read status.');
+    return;
+  }
+
+  sendSuccess(
+    res,
+    diaries.map((diary) => ({
+      ...diary,
+      my_read_at: readMap.get(diary.id as string) ?? null,
+    })),
+  );
 });
 
 // ────────────────────────────────────────────────────────────
@@ -164,12 +269,140 @@ router.post('/', authenticate, async (req: Request, res: Response): Promise<void
   sendSuccess(res, { ...diary, diary_images: savedImages }, 201);
 });
 
+// Read status for requested accessible diaries.
+router.get('/read-status', authenticate, async (req: Request, res: Response): Promise<void> => {
+  const { userId, accessToken } = req as AuthenticatedRequest;
+  const parsed = parseIdList(req.query.ids);
+
+  if (parsed.error) {
+    sendBadRequest(res, parsed.error);
+    return;
+  }
+
+  const supabase = createUserClient(accessToken);
+
+  const { data: diaries, error: diaryError } = await supabase
+    .from('diaries')
+    .select('id')
+    .in('id', parsed.ids);
+
+  if (diaryError) {
+    sendInternalError(res, 'Failed to fetch diaries.');
+    return;
+  }
+
+  const accessibleIds = (diaries ?? []).map((diary) => diary.id as string);
+  const accessibleIdSet = new Set(accessibleIds);
+
+  if (accessibleIds.length === 0) {
+    sendSuccess(res, {});
+    return;
+  }
+
+  const { readMap, error: readsError } = await fetchMyReadMap(
+    supabase,
+    userId,
+    accessibleIds,
+  );
+
+  if (readsError) {
+    sendInternalError(res, 'Failed to fetch diary read status.');
+    return;
+  }
+
+  const result: Record<string, string | null> = {};
+  for (const id of parsed.ids) {
+    if (accessibleIdSet.has(id)) {
+      result[id] = readMap.get(id) ?? null;
+    }
+  }
+
+  sendSuccess(res, result);
+});
+
+// Mark one accessible diary as read by the current user.
+router.put('/:id/read', authenticate, async (req: Request, res: Response): Promise<void> => {
+  const { userId, accessToken } = req as AuthenticatedRequest;
+  const { id } = req.params;
+
+  if (!uuidSchema.safeParse(id).success) {
+    sendBadRequest(res, 'id must be a UUID.');
+    return;
+  }
+
+  const supabase = createUserClient(accessToken);
+
+  const { data: diary, error: diaryError } = await supabase
+    .from('diaries')
+    .select('id')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (diaryError) {
+    sendInternalError(res, 'Failed to fetch diary.');
+    return;
+  }
+
+  if (!diary) {
+    sendNotFound(res, '?쇨린瑜?李얠쓣 ???놁뒿?덈떎.');
+    return;
+  }
+
+  const { error: upsertError } = await supabase
+    .from('diary_reads')
+    .upsert(
+      { user_id: userId, diary_id: id },
+      { onConflict: 'user_id,diary_id', ignoreDuplicates: true },
+    );
+
+  if (upsertError) {
+    if (isDiaryReadsUnavailableError(upsertError)) {
+      warnMissingDiaryReadsTable(upsertError);
+      sendSuccess(res, {
+        diary_id: id,
+        read_at:  new Date().toISOString(),
+      });
+      return;
+    }
+
+    console.error('[DIARY READ] upsert error:', upsertError);
+    sendInternalError(res, 'Failed to mark diary as read.');
+    return;
+  }
+
+  const { data: read, error: readError } = await supabase
+    .from('diary_reads')
+    .select('diary_id, read_at')
+    .eq('user_id', userId)
+    .eq('diary_id', id)
+    .maybeSingle();
+
+  if (readError || !read) {
+    if (readError && isDiaryReadsUnavailableError(readError)) {
+      warnMissingDiaryReadsTable(readError);
+      sendSuccess(res, {
+        diary_id: id,
+        read_at:  new Date().toISOString(),
+      });
+      return;
+    }
+
+    sendInternalError(res, 'Failed to fetch diary read status.');
+    return;
+  }
+
+  sendSuccess(res, {
+    diary_id: read.diary_id,
+    read_at:  read.read_at,
+  });
+});
+
 // ────────────────────────────────────────────────────────────
 // GET /diaries/:id
 // 단일 일기 조회 (이미지 + 댓글 + 반응 포함)
 // ────────────────────────────────────────────────────────────
 router.get('/:id', authenticate, async (req: Request, res: Response): Promise<void> => {
-  const { accessToken } = req as AuthenticatedRequest;
+  const { userId, accessToken } = req as AuthenticatedRequest;
   const { id } = req.params;
   const supabase = createUserClient(accessToken);
 
@@ -189,7 +422,21 @@ router.get('/:id', authenticate, async (req: Request, res: Response): Promise<vo
     return;
   }
 
-  sendSuccess(res, data);
+  const { readMap, error: readsError } = await fetchMyReadMap(
+    supabase,
+    userId,
+    [data.id as string],
+  );
+
+  if (readsError) {
+    sendInternalError(res, 'Failed to fetch diary read status.');
+    return;
+  }
+
+  sendSuccess(res, {
+    ...data,
+    my_read_at: readMap.get(data.id as string) ?? null,
+  });
 });
 
 // ────────────────────────────────────────────────────────────

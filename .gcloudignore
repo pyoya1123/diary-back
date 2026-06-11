@@ -5,6 +5,7 @@ dist
 .git
 .gitignore
 .env
+env.yaml
 .env.local
 .env.*.local
 docs
